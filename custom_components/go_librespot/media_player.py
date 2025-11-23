@@ -19,6 +19,7 @@ from homeassistant.const import CONF_HOST, CONF_PORT, CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util import dt as dt_util  # ADDED: For proper timestamp handling
 
 from .const import DOMAIN
 
@@ -46,6 +47,7 @@ class GoLibrespotWebSocketClient:
         self._data = None
         self._connected = False
         self._last_volume_update = None
+        self._position_updated_at = None  # ADDED: Store position timestamp
 
     @property
     def data(self):
@@ -56,6 +58,11 @@ class GoLibrespotWebSocketClient:
     def connected(self) -> bool:
         """Return connection status."""
         return self._connected
+    
+    @property
+    def position_updated_at(self) -> datetime | None:
+        """Return when position was last updated."""
+        return self._position_updated_at
 
     async def connect(self) -> bool:
         """Connect to the WebSocket."""
@@ -112,6 +119,16 @@ class GoLibrespotWebSocketClient:
                                 self._data = new_data
                         else:
                             self._data = new_data
+                        
+                        # ADDED: Update position timestamp when fetching status
+                        # Position can be at root or inside track object
+                        if self._data:
+                            has_position = "position" in self._data
+                            if not has_position and "track" in self._data:
+                                has_position = "position" in self._data["track"]
+                            if has_position:
+                                self._position_updated_at = dt_util.utcnow()
+                                _LOGGER.debug("Updated position timestamp from status fetch")
 
                         # Debug album cover URL from initial status
                         if self._data and "track" in self._data and self._data["track"]:
@@ -183,6 +200,11 @@ class GoLibrespotWebSocketClient:
                 "duration": event.get("duration"),
             }
             self._data["track"] = track_data
+            
+            # ADDED: Reset position to 0 for new track
+            self._data["position"] = 0
+            self._position_updated_at = dt_util.utcnow()
+            _LOGGER.debug("New track metadata - reset position to 0")
 
         elif event_type in ["playing", "will_play"]:
             self._data["paused"] = False
@@ -198,6 +220,12 @@ class GoLibrespotWebSocketClient:
                     # Keep existing metadata if available, WebSocket metadata event will update it
             if "play_origin" in event:
                 self._data["play_origin"] = event["play_origin"]
+            
+            # ADDED: Update position timestamp when playback starts
+            if "position" in event:
+                self._data["position"] = event["position"]
+                self._position_updated_at = dt_util.utcnow()
+                _LOGGER.debug("Updated position from playing event")
 
         elif event_type == "paused":
             self._data["paused"] = True
@@ -209,6 +237,12 @@ class GoLibrespotWebSocketClient:
                     self._data["track"]["uri"] = event["uri"]
             if "play_origin" in event:
                 self._data["play_origin"] = event["play_origin"]
+            
+            # ADDED: Update position timestamp when paused
+            if "position" in event:
+                self._data["position"] = event["position"]
+                self._position_updated_at = dt_util.utcnow()
+                _LOGGER.debug("Updated position from paused event")
 
         elif event_type == "not_playing":
             self._data["paused"] = True
@@ -220,11 +254,18 @@ class GoLibrespotWebSocketClient:
             self._data["paused"] = False
             if "play_origin" in event:
                 self._data["play_origin"] = event["play_origin"]
+            
+            # ADDED: Clear position when stopped
+            self._data["position"] = 0
+            self._position_updated_at = None
+            _LOGGER.debug("Stopped - cleared position")
 
         elif event_type == "seek":
-            # Update position information
+            # MODIFIED: Update position information with proper timestamp
             if "position" in event:
                 self._data["position"] = event["position"]
+                self._position_updated_at = dt_util.utcnow()  # ADDED
+                _LOGGER.debug("Updated position from seek event: %s", event["position"])
             # Update track data if we have it, but don't overwrite existing metadata
             if "track" in self._data and self._data["track"]:
                 if "duration" in event:
@@ -506,16 +547,17 @@ class GoLibrespotMediaPlayer(MediaPlayerEntity):
         """Position of current playing media in seconds."""
         if not self._ws_client.data:
             return None
+        # Position can be at root level or inside track object
         position_ms = self._ws_client.data.get("position")
+        if position_ms is None and "track" in self._ws_client.data:
+            position_ms = self._ws_client.data["track"].get("position")
         return position_ms // 1000 if position_ms else None
 
     @property
     def media_position_updated_at(self) -> datetime | None:
         """When was the position of the current playing media valid."""
-        # Since we get real-time position updates via WebSocket, we can use current time
-        if self.media_position is not None and self.state == MediaPlayerState.PLAYING:
-            return datetime.now()
-        return None
+        # FIXED: Return the stored timestamp instead of datetime.now()
+        return self._ws_client.position_updated_at
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -620,6 +662,14 @@ class GoLibrespotMediaPlayer(MediaPlayerEntity):
     async def async_media_seek(self, position: float) -> None:
         """Send seek command."""
         position_ms = int(position * 1000)
+        
+        # ADDED: Update position immediately for responsive UI
+        if self._ws_client.data:
+            self._ws_client.data["position"] = position_ms
+            self._ws_client._position_updated_at = dt_util.utcnow()
+            self._handle_update()
+        
+        # Send the seek command
         await self._ws_client.make_request(
             "/player/seek", data={"position": position_ms}
         )
