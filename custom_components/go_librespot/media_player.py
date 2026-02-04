@@ -76,7 +76,6 @@ class GoLibrespotWebSocketClient:
             _LOGGER.debug("Connecting to WebSocket at %s", self.ws_url)
             self._ws = await self.session.ws_connect(self.ws_url)
             self._connected = True
-            
             # Reset reconnect attempts on successful connection
             self._reconnect_attempts = 0
 
@@ -317,16 +316,15 @@ class GoLibrespotWebSocketClient:
             return
 
         async def reconnect():
-            # Calculate delay with exponential backoff: 5s, 10s, 20s, 40s, 60s (max)
-            delay = min(5 * (2 ** self._reconnect_attempts), self._max_reconnect_delay)
+            # Increment attempt counter before calculating delay
             self._reconnect_attempts += 1
-            
+            # Calculate delay with exponential backoff: 5s, 10s, 20s, 40s, 60s (max)
+            delay = min(5 * (2 ** (self._reconnect_attempts - 1)), self._max_reconnect_delay)
             _LOGGER.info(
                 "Scheduling reconnection attempt #%d in %d seconds",
                 self._reconnect_attempts,
                 delay
             )
-            
             await asyncio.sleep(delay)
             
             if not self._connected:
