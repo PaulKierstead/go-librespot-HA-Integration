@@ -48,6 +48,8 @@ class GoLibrespotWebSocketClient:
         self._connected = False
         self._last_volume_update = None
         self._position_updated_at = None  # ADDED: Store position timestamp
+        self._reconnect_attempts = 0  # ADDED: Track reconnection attempts
+        self._max_reconnect_delay = 60  # ADDED: Maximum delay between reconnects (seconds)
 
     @property
     def data(self):
@@ -74,6 +76,9 @@ class GoLibrespotWebSocketClient:
             _LOGGER.debug("Connecting to WebSocket at %s", self.ws_url)
             self._ws = await self.session.ws_connect(self.ws_url)
             self._connected = True
+            
+            # Reset reconnect attempts on successful connection
+            self._reconnect_attempts = 0
 
             # Start listening for messages
             self._listen_task = asyncio.create_task(self._listen())
@@ -307,14 +312,25 @@ class GoLibrespotWebSocketClient:
         self.update_callback()
 
     def _schedule_reconnect(self) -> None:
-        """Schedule a reconnection attempt."""
+        """Schedule a reconnection attempt with exponential backoff."""
         if self._reconnect_task and not self._reconnect_task.done():
             return
 
         async def reconnect():
-            await asyncio.sleep(5)  # Wait 5 seconds before reconnecting
+            # Calculate delay with exponential backoff: 5s, 10s, 20s, 40s, 60s (max)
+            delay = min(5 * (2 ** self._reconnect_attempts), self._max_reconnect_delay)
+            self._reconnect_attempts += 1
+            
+            _LOGGER.info(
+                "Scheduling reconnection attempt #%d in %d seconds",
+                self._reconnect_attempts,
+                delay
+            )
+            
+            await asyncio.sleep(delay)
+            
             if not self._connected:
-                _LOGGER.info("Attempting to reconnect to WebSocket")
+                _LOGGER.info("Attempting to reconnect to WebSocket (attempt #%d)", self._reconnect_attempts)
                 await self.connect()
 
         self._reconnect_task = asyncio.create_task(reconnect())
